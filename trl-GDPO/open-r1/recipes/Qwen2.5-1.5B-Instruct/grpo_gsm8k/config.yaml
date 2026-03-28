@@ -12,7 +12,7 @@ dataset_prompt_column: problem ## this is just placeholder
 bf16: true
 use_vllm: true
 do_eval: false
-gradient_accumulation_steps: 4
+gradient_accumulation_steps: 8
 gradient_checkpointing: true
 gradient_checkpointing_kwargs:
   use_reentrant: false
@@ -29,7 +29,7 @@ max_prompt_length: 512
 max_completion_length: 1024
 max_steps: -1
 num_generations: 16
-num_train_epochs: 1
+num_train_epochs: 4
 output_dir: ./trl-GDPO/Qwen2.5-1.5B-gsm8k-GRPO-3-rewards
 overwrite_output_dir: true
 per_device_eval_batch_size: 16
@@ -37,7 +37,7 @@ per_device_train_batch_size: 16
 push_to_hub: false
 report_to:
 - wandb
-wandb_project: "open-r1-gsm8k-3-rewards"
+wandb_project: "open-r1-gsm8k-4-rewards"
 run_name: "Qwen2.5-1.5B-gsm8k-GRPO"
 save_strategy: "steps"
 save_steps: 20
