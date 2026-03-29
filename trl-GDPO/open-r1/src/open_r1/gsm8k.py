@@ -164,6 +164,9 @@ def main(script_args, training_args, model_args):
     # Set seed for reproducibility
     set_seed(training_args.seed)
 
+    if training_args.run_name:
+        training_args.output_dir = os.path.join(os.path.dirname(training_args.output_dir), training_args.run_name)
+
     ###############
     # Setup logging
     ###############
