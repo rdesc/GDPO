@@ -12,7 +12,7 @@ dataset_prompt_column: problem ## this is just placeholder
 bf16: true
 use_vllm: true
 do_eval: false
-gradient_accumulation_steps: 8
+gradient_accumulation_steps: 16
 gradient_checkpointing: true
 gradient_checkpointing_kwargs:
   use_reentrant: false
@@ -30,7 +30,7 @@ max_completion_length: 1024
 max_steps: -1
 num_generations: 16
 num_train_epochs: 4
-output_dir: /home/mila/d/deschaer/scratch/gdpo-output/Qwen2.5-1.5B-gsm8k-GDPO-3-rewards
+output_dir: /home/mila/g/girgisro/scratch/constrained_grpo/trl-GDPO/Qwen2.5-1.5B-gsm8k-GDPO-4-rewards
 overwrite_output_dir: true
 per_device_eval_batch_size: 16
 per_device_train_batch_size: 16

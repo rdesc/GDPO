@@ -30,6 +30,7 @@
 import logging
 import os
 import sys
+from functools import partial, update_wrapper
 
 import datasets
 import transformers
@@ -125,7 +126,35 @@ def format_reward_func(completions, **kwargs) -> list[float]:
     return rewards
 
 
+def length_reward_func(completions, answer, completion_ids, **kwargs) -> list[float]:
+    contents = [completion[0]["content"] for completion in completions]
+    extracted_responses = [extract_xml_answer(content) for content in contents]
+    correctness = [response == gold for response, gold in zip(extracted_responses, answer)]
 
+    lengths = [len(ids) for ids in completion_ids]
+    min_len = min(lengths)
+    max_len = max(lengths)
+
+    if max_len == min_len:
+        return [0.0] * len(completions)
+
+    rewards = []
+    for length, is_correct in zip(lengths, correctness):
+        lambda_val = 0.5 - (length - min_len) / (max_len - min_len)
+        reward = lambda_val if is_correct else min(0, lambda_val)
+        rewards.append(float(reward))
+
+    return rewards
+
+
+def length_constraint_reward_func(completions, answer, completion_ids, max_length_threshold=350, **kwargs) -> list[float]:
+    """Binary feasibility version of the length reward.
+
+    The constraint is an absolute token budget: any completion with at most
+    `max_length_threshold` tokens is marked as satisfying the constraint.
+    """
+    lengths = [len(ids) for ids in completion_ids]
+    return [1.0 if length <= max_length_threshold else 0.0 for length in lengths]
 
 
 
@@ -187,13 +216,21 @@ def main(script_args, training_args, model_args):
     #############################
     # Initialize the GRPO trainer
     #############################
-    trainer = GRPOTrainer(
-        model=model,
-        reward_funcs = [
+    constraint_length_reward = update_wrapper(
+        partial(length_constraint_reward_func, max_length_threshold=training_args.max_length_threshold),
+        length_constraint_reward_func,
+    )
+
+    reward_funcs = [
         correctness_reward_func,
         int_reward_func,
         format_reward_func,
-        ],
+        constraint_length_reward if training_args.use_constraints else length_reward_func,
+    ]
+
+    trainer = GRPOTrainer(
+        model=model,
+        reward_funcs=reward_funcs,
         args=training_args,
         train_dataset=dataset,
         eval_dataset=(dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None),

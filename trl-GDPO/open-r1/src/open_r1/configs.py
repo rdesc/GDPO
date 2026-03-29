@@ -164,6 +164,22 @@ class GRPOConfig(trl.GRPOConfig):
         default=None,
         metadata={"help": ("The group to store runs under.")},
     )
+    use_constraints: bool = field(
+        default=False,
+        metadata={"help": "Enable constrained optimization. Reward 0 is treated as the main reward and later rewards are treated as constraint satisfaction signals."},
+    )
+    constraints_thresholds: Optional[list[float]] = field(
+        default=None,
+        metadata={"help": "Target satisfaction rates for each constraint reward. Must match the number of non-main reward functions when set."},
+    )
+    update_constraints_every_k_policy_steps: int = field(
+        default=1,
+        metadata={"help": "Update constraint multipliers every k policy steps."},
+    )
+    max_length_threshold: int = field(
+        default=350,
+        metadata={"help": "Maximum allowed completion length in tokens for the GSM8K length constraint."},
+    )
 
 
 @dataclass

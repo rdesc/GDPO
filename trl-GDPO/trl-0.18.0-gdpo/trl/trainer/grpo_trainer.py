@@ -43,6 +43,7 @@ from accelerate.utils import broadcast_object_list, gather, gather_object, is_pe
 from datasets import Dataset, IterableDataset
 from packaging import version
 from torch import nn
+from torch.optim import Adam
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.utils.data import DataLoader, Sampler
 from transformers import (
@@ -482,6 +483,18 @@ class GRPOTrainer(Trainer):
             self.apply_gdpo = True
         else:
             self.apply_gdpo = False
+        self.use_constraints = getattr(args, "use_constraints", False)
+        self.constraint_names = self.reward_func_names[1:] if self.use_constraints else []
+        self.constraints_list = []
+        self.update_every_k_policy_steps = getattr(args, "update_constraints_every_k_policy_steps", 1)
+        self.multiplier_signs = -1.0
+        self.constraint_warmup_steps = 1
+        if self.use_constraints and len(self.reward_funcs) < 2:
+            raise ValueError("`use_constraints=True` requires at least one main reward and one constraint reward.")
+        if self.use_constraints and args.reward_weights is not None:
+            warnings.warn(
+                "`reward_weights` are ignored when `use_constraints=True`; reward 0 is the main reward and rewards 1..N are constraints."
+            )
 
         # Reward processing class
         if reward_processing_classes is None:
@@ -616,6 +629,25 @@ class GRPOTrainer(Trainer):
         self.log_completions = args.log_completions
         self.wandb_log_unique_prompts = args.wandb_log_unique_prompts
         self.num_completions_to_print = args.num_completions_to_print
+        if self.use_constraints:
+            constraint_thresholds = getattr(args, "constraints_thresholds", None)
+            if constraint_thresholds is None:
+                constraint_thresholds = [1.0] * len(self.constraint_names)
+            if len(constraint_thresholds) != len(self.constraint_names):
+                raise ValueError(
+                    f"Number of constraint thresholds ({len(constraint_thresholds)}) must match number of constraints "
+                    f"({len(self.constraint_names)})"
+                )
+            self.multiplier_params = torch.full(
+                size=(len(self.constraint_names) + 1,),
+                fill_value=0.02,
+                requires_grad=True,
+                device=self.accelerator.device,
+            )
+            self.multipliers_optim = Adam([self.multiplier_params], lr=100 * 0.0003, eps=1e-5, betas=(0.9, 0.999))
+            self.constraint_thresholds = 1.0 - torch.tensor(
+                constraint_thresholds, dtype=torch.float32, device=self.accelerator.device
+            )
         # maxlen is set to the total number of forward passes per step. This value of `maxlen` ensures we log only the
         # final optimization step.
         maxlen = self.accelerator.num_processes * args.per_device_train_batch_size * args.steps_per_generation
@@ -1218,8 +1250,89 @@ class GRPOTrainer(Trainer):
         # completions may be distributed across processes
         rewards_per_func = gather(rewards_per_func)
 
+        if self.use_constraints:
+            rewards_per_func_filter = torch.nan_to_num(rewards_per_func)
+            main_rewards = rewards_per_func_filter[:, 0]
+            constraint_rewards = rewards_per_func_filter[:, 1:]
+            constraint_values = 1.0 - constraint_rewards
+            self.constraints_list.append(constraint_values.detach().cpu())
+
+            avg_constraint_values = constraint_values.mean(0)
+            avg_constraint_satisfaction = constraint_rewards.mean(0)
+            for k, constraint_name in enumerate(self.constraint_names):
+                self._metrics[mode][f"constraints/{constraint_name}"].append(avg_constraint_values[k].item())
+                self._metrics[mode][f"constraint_satisfaction/{constraint_name}"].append(
+                    avg_constraint_satisfaction[k].item()
+                )
+
+            multipliers = torch.nn.functional.softmax(self.multiplier_params, dim=0)[1:]
+            if self.state.global_step % self.update_every_k_policy_steps == 0 and len(self.constraints_list) > 0:
+                train_avg_constraint_values = torch.cat(self.constraints_list, dim=0).to(device=device).mean(0)
+                enforced_thresholds = []
+                for k_index in range(len(self.constraint_names)):
+                    curr_constraint_threshold = self.constraint_thresholds[k_index]
+                    enforced_threshold = 0.5 + (curr_constraint_threshold - 0.5) * min(
+                        1.0, max(0.0, self.state.global_step / self.constraint_warmup_steps)
+                    )
+                    enforced_thresholds.append(enforced_threshold)
+                enforced_thresholds = torch.stack(enforced_thresholds)
+
+                multiplier_losses = self.multiplier_signs * multipliers * (
+                    train_avg_constraint_values - enforced_thresholds
+                )
+                multiplier_loss = torch.sum(multiplier_losses, dim=0)
+                self.multipliers_optim.zero_grad()
+                multiplier_loss.backward()
+                self.multipliers_optim.step()
+                self.constraints_list = []
+
+            cost_weights = self.multiplier_signs * multipliers.detach()
+            reward_weight = 1.0 - torch.sum(torch.abs(cost_weights), dim=0)
+            self._metrics[mode]["multipliers/reward_weight"].append(
+                self.accelerator.gather_for_metrics(reward_weight).mean().item()
+            )
+            for k, constraint_name in enumerate(self.constraint_names):
+                self._metrics[mode][f"raw_multipliers_values/{constraint_name}"].append(
+                    self.accelerator.gather_for_metrics(self.multiplier_params[k + 1]).mean().item()
+                )
+                self._metrics[mode][f"multipliers/{constraint_name}"].append(
+                    self.accelerator.gather_for_metrics(torch.abs(cost_weights[k])).mean().item()
+                )
+
+            if self.apply_gdpo:
+                rewards = main_rewards
+            else:
+                rewards = main_rewards * reward_weight
+                rewards = rewards + (cost_weights.unsqueeze(0) * constraint_values).sum(dim=1)
+
+            mean_grouped_rewards = rewards.view(-1, self.num_generations).mean(dim=1)
+            std_grouped_rewards = rewards.view(-1, self.num_generations).std(dim=1)
+            is_std_zero = torch.isclose(std_grouped_rewards, torch.zeros_like(std_grouped_rewards))
+
+            mean_grouped_rewards = mean_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+            std_grouped_rewards = std_grouped_rewards.repeat_interleave(self.num_generations, dim=0)
+            advantages = rewards - mean_grouped_rewards
+            if self.scale_rewards:
+                advantages = advantages / (std_grouped_rewards + 1e-4)
+
+            if self.apply_gdpo:
+                advantages = reward_weight * advantages
+                for k, _constraint_name in enumerate(self.constraint_names):
+                    curr_constraint_values = constraint_values[:, k]
+                    mean_grouped_curr_constraint = curr_constraint_values.view(-1, self.num_generations).mean(dim=1)
+                    std_grouped_curr_constraint = curr_constraint_values.view(-1, self.num_generations).std(dim=1)
+                    mean_grouped_curr_constraint = mean_grouped_curr_constraint.repeat_interleave(
+                        self.num_generations, dim=0
+                    )
+                    std_grouped_curr_constraint = std_grouped_curr_constraint.repeat_interleave(
+                        self.num_generations, dim=0
+                    )
+                    constraint_advantage = curr_constraint_values - mean_grouped_curr_constraint
+                    constraint_advantage = constraint_advantage / (std_grouped_curr_constraint + 1e-4)
+                    advantages = advantages + (cost_weights[k] * constraint_advantage)
+
         ### only apply gdpo when having more than one reward
-        if self.apply_gdpo and len(self.reward_weights) > 1:
+        elif self.apply_gdpo and len(self.reward_weights) > 1:
             print(f"Apply GDPO for multi-reward")
 
             ## Make sure every reward contain no nan value
@@ -1302,7 +1415,7 @@ class GRPOTrainer(Trainer):
             std_rewards = nanstd(rewards_per_func[:, i]).item()
             self._metrics[mode][f"rewards/{reward_func_name}/std"].append(std_rewards)
         
-        if self.apply_gdpo and len(self.reward_weights) > 1:
+        if not self.use_constraints and self.apply_gdpo and len(self.reward_weights) > 1:
             ## simply for reporting reward dynamic, we need to calculate the following values:
 
             rewards = (rewards_per_func * self.reward_weights.to(device).unsqueeze(0)).nansum(dim=1)

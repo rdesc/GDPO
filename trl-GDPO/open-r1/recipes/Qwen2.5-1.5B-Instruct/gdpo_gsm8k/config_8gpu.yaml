@@ -8,15 +8,15 @@ dataset_name: open-r1/OpenR1-Math-220k ## this is just placeholder
 dataset_prompt_column: problem ## this is just placeholder
 
 
-# GRPO trainer config
+# GDPO trainer config
 bf16: true
 use_vllm: true
 do_eval: false
-gradient_accumulation_steps: 16
+gradient_accumulation_steps: 8
 gradient_checkpointing: true
 gradient_checkpointing_kwargs:
   use_reentrant: false
-hub_model_id: Qwen2.5-1.5B-Open-R1-GRPO
+hub_model_id: Qwen2.5-1.5B-Open-R1-GDPO
 hub_strategy: every_save
 learning_rate: 5.0e-06
 log_completions: true
@@ -30,15 +30,16 @@ max_completion_length: 1024
 max_steps: -1
 num_generations: 16
 num_train_epochs: 4
-output_dir: /home/mila/g/girgisro/scratch/constrained_grpo/trl-GDPO/Qwen2.5-1.5B-gsm8k-GRPO-4-rewards
+output_dir: /scratch/r/rogerg/constrained_grpo/trl-GDPO/Qwen2.5-1.5B-gsm8k-GDPO-4-rewards
 overwrite_output_dir: true
 per_device_eval_batch_size: 16
 per_device_train_batch_size: 16
 push_to_hub: false
+apply_gdpo: True
 report_to:
 - wandb
 wandb_project: "open-r1-gsm8k-4-rewards"
-run_name: "Qwen2.5-1.5B-gsm8k-GRPO"
+run_name: "Qwen2.5-1.5B-gsm8k-GDPO"
 save_strategy: "steps"
 save_steps: 20
 save_total_limit: 1
