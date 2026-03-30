@@ -224,11 +224,17 @@ def main(script_args, training_args, model_args):
         length_constraint_reward_func,
     )
 
+    # reward_funcs = [
+    #     correctness_reward_func,
+    #     int_reward_func,
+    #     format_reward_func,
+    #     constraint_length_reward if training_args.use_constraints else length_reward_func,
+    # ]
     reward_funcs = [
-        correctness_reward_func,
+        length_reward_func,
         int_reward_func,
         format_reward_func,
-        constraint_length_reward if training_args.use_constraints else length_reward_func,
+        correctness_reward_func,
     ]
 
     trainer = GRPOTrainer(
