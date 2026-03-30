@@ -126,12 +126,33 @@ def format_reward_func(completions, **kwargs) -> list[float]:
     return rewards
 
 
-def length_reward_func(completions, answer, completion_ids, **kwargs) -> list[float]:
+def og__length_reward_func(completions, answer, completion_ids, **kwargs) -> list[float]:
     contents = [completion[0]["content"] for completion in completions]
     extracted_responses = [extract_xml_answer(content) for content in contents]
     correctness = [response == gold for response, gold in zip(extracted_responses, answer)]
 
     lengths = [len(ids) for ids in completion_ids]
+    min_len = min(lengths)
+    max_len = max(lengths)
+
+    if max_len == min_len:
+        return [0.0] * len(completions)
+
+    rewards = []
+    for length, is_correct in zip(lengths, correctness):
+        lambda_val = 0.5 - (length - min_len) / (max_len - min_len)
+        reward = lambda_val if is_correct else min(0, lambda_val)
+        rewards.append(float(reward))
+
+    return rewards
+
+
+def length_reward_func(completions, answer, completion_ids, **kwargs) -> list[float]:
+    contents = [completion[0]["content"] for completion in completions]
+    extracted_responses = [extract_xml_answer(content) for content in contents]
+    correctness = [response == gold for response, gold in zip(extracted_responses, answer)]
+
+    lengths = [len(content) for content in contents]
     min_len = min(lengths)
     max_len = max(lengths)
 
