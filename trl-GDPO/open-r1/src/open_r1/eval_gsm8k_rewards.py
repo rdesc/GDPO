@@ -40,6 +40,10 @@ class EvalArguments:
         default=None,
         metadata={"help": "Optional attention implementation override for model loading."},
     )
+    max_eval_batches: Optional[int] = field(
+        default=None,
+        metadata={"help": "If set, only evaluate roughly the first N global eval batches for a quick sanity check."},
+    )
 
 
 def resolve_tokenizer_path(model_path: str, tokenizer_path: Optional[str]) -> str:
@@ -127,6 +131,19 @@ def main():
     model = AutoModelForCausalLM.from_pretrained(eval_args.model_name_or_path, **model_kwargs)
 
     eval_dataset = get_gsm8k_questions(eval_args.split)
+    if eval_args.max_eval_batches is not None:
+        world_size = max(1, int(os.environ.get("WORLD_SIZE", "1")))
+        prompts_per_global_batch = max(
+            1, (training_args.per_device_eval_batch_size * world_size) // training_args.num_generations
+        )
+        max_examples = min(len(eval_dataset), eval_args.max_eval_batches * prompts_per_global_batch)
+        eval_dataset = eval_dataset.select(range(max_examples))
+        logger.info(
+            "Quick eval enabled: max_eval_batches=%s, prompts_per_global_batch=%s, eval_examples=%s",
+            eval_args.max_eval_batches,
+            prompts_per_global_batch,
+            len(eval_dataset),
+        )
     reward_funcs = build_reward_funcs(training_args)
 
     trainer = GRPOTrainer(
@@ -160,6 +177,7 @@ def main():
 
     logger.info("Saved metrics to %s", metrics_path)
     logger.info("Metrics: %s", json.dumps(metrics, indent=2, sort_keys=True))
+    print(metrics)
 
 
 if __name__ == "__main__":

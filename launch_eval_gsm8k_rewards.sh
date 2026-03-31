@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Usage:
-#   bash launch_eval_gsm8k_rewards.sh /path/to/checkpoint [tokenizer_name_or_path] [output_dir] [num_processes] [accelerate_config]
+#   bash launch_eval_gsm8k_rewards.sh /path/to/checkpoint [tokenizer_name_or_path] [output_dir] [num_processes] [accelerate_config] [max_eval_batches]
 #
 # For the GSM8K launch scripts in this repo, the tokenizer should normally be the
 # base model tokenizer used for training, e.g.:
@@ -17,6 +17,7 @@ TOKENIZER_PATH=${2:-}
 OUTPUT_DIR=${3:-"$SCRIPT_DIR/gsm8k_eval_results/$(basename "$CHECKPOINT_PATH")"}
 NUM_PROCESSES=${4:-1}
 ACCELERATE_CONFIG=${5:-}
+MAX_EVAL_BATCHES=${6:-}
 
 module load anaconda/3
 module load cudatoolkit/12.4.0
@@ -36,6 +37,9 @@ ARGS=(
 
 if [[ -n "$TOKENIZER_PATH" ]]; then
     ARGS+=(--tokenizer_name_or_path "$TOKENIZER_PATH")
+fi
+if [[ -n "$MAX_EVAL_BATCHES" ]]; then
+    ARGS+=(--max_eval_batches "$MAX_EVAL_BATCHES")
 fi
 
 if [[ -z "$ACCELERATE_CONFIG" && "$NUM_PROCESSES" == "8" && -f "recipes/accelerate_configs/zero3_8gpu.yaml" ]]; then
