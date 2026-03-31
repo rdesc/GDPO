@@ -107,6 +107,25 @@ def build_eval_training_args(saved_training_args, eval_args: EvalArguments):
     return training_args
 
 
+def get_latest_eval_log(trainer):
+    for entry in reversed(trainer.state.log_history):
+        if any(key.startswith("eval_") for key in entry.keys()):
+            return entry
+    return {}
+
+
+def extract_per_reward(metrics):
+    per_reward = {}
+    for key, value in metrics.items():
+        prefix = "eval_rewards/"
+        if not key.startswith(prefix):
+            continue
+        remainder = key[len(prefix) :]
+        reward_name, stat_name = remainder.rsplit("/", 1)
+        per_reward.setdefault(reward_name, {})[stat_name] = value
+    return per_reward
+
+
 def main():
     parser = HfArgumentParser(EvalArguments)
     (eval_args,) = parser.parse_args_into_dataclasses()
@@ -165,10 +184,13 @@ def main():
     )
 
     metrics = trainer.evaluate(eval_dataset=eval_dataset)
+    eval_log = get_latest_eval_log(trainer)
+    metrics.update(eval_log)
     metrics["eval_samples"] = len(eval_dataset)
     metrics["split"] = eval_args.split
     metrics["model_name_or_path"] = eval_args.model_name_or_path
     metrics["tokenizer_name_or_path"] = tokenizer_path
+    metrics["per_reward"] = extract_per_reward(metrics)
 
     os.makedirs(eval_args.output_dir, exist_ok=True)
     metrics_path = os.path.join(eval_args.output_dir, "metrics.json")
