@@ -1,3 +1,4 @@
+import copy
 import json
 import logging
 import os
@@ -5,20 +6,10 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
-from accelerate import Accelerator
-from accelerate.utils import gather_object
-from datasets import Dataset
-from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer, HfArgumentParser
 
-from open_r1.gsm8k import (
-    correctness_reward_func,
-    format_reward_func,
-    get_gsm8k_questions,
-    int_reward_func,
-    length_constraint_reward_func,
-    length_reward_func,
-)
+from open_r1.gsm8k import build_reward_funcs, get_gsm8k_questions
+from trl import GRPOTrainer
 
 
 logger = logging.getLogger(__name__)
@@ -29,23 +20,24 @@ class EvalArguments:
     model_name_or_path: str = field(metadata={"help": "Path to the RL-finetuned checkpoint or saved model."})
     tokenizer_name_or_path: Optional[str] = field(
         default=None,
-        metadata={"help": "Optional tokenizer path. Defaults to the model path, then the parent directory for checkpoints."},
+        metadata={"help": "Tokenizer path. For your GSM8K runs this is typically the base model tokenizer."},
     )
-    split: str = field(default="test", metadata={"help": "GSM8K split to evaluate. Usually 'test'."})
-    output_dir: str = field(default="gsm8k_eval_results", metadata={"help": "Directory for metrics and predictions."})
-    per_device_eval_batch_size: int = field(default=8, metadata={"help": "Per-device evaluation batch size."})
-    max_prompt_length: int = field(default=512, metadata={"help": "Max prompt length in tokens."})
-    max_completion_length: int = field(default=1024, metadata={"help": "Max generated completion length in tokens."})
-    temperature: float = field(default=0.0, metadata={"help": "Sampling temperature. Use 0.0 for greedy decoding."})
-    top_p: float = field(default=1.0, metadata={"help": "Top-p sampling parameter when temperature > 0."})
-    do_sample: bool = field(default=False, metadata={"help": "Enable sampling instead of greedy decoding."})
-    torch_dtype: str = field(default="bfloat16", metadata={"help": "Torch dtype: bfloat16, float16, float32, auto."})
-    attn_implementation: Optional[str] = field(
-        default="flash_attention_2", metadata={"help": "Attention implementation passed to from_pretrained."}
-    )
-    max_length_threshold: Optional[int] = field(
+    split: str = field(default="test", metadata={"help": "GSM8K split to evaluate."})
+    output_dir: str = field(default="gsm8k_eval_results", metadata={"help": "Directory for evaluation outputs."})
+    per_device_eval_batch_size: Optional[int] = field(
         default=None,
-        metadata={"help": "If set, also compute the binary length constraint reward with this token threshold."},
+        metadata={"help": "Optional override for per-device eval batch size."},
+    )
+    max_prompt_length: Optional[int] = field(default=None, metadata={"help": "Optional prompt length override."})
+    max_completion_length: Optional[int] = field(
+        default=None, metadata={"help": "Optional completion length override."}
+    )
+    num_generations: Optional[int] = field(default=None, metadata={"help": "Optional num_generations override."})
+    use_vllm: Optional[bool] = field(default=None, metadata={"help": "Optional use_vllm override."})
+    vllm_mode: Optional[str] = field(default=None, metadata={"help": "Optional vllm_mode override."})
+    attn_implementation: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional attention implementation override for model loading."},
     )
 
 
@@ -64,198 +56,105 @@ def resolve_tokenizer_path(model_path: str, tokenizer_path: Optional[str]) -> st
     return model_path
 
 
-def get_dtype(dtype_name: str):
-    if dtype_name == "auto":
-        return "auto"
-    return getattr(torch, dtype_name)
+def load_training_args(model_path: str):
+    training_args_path = os.path.join(model_path, "training_args.bin")
+    if not os.path.exists(training_args_path):
+        raise FileNotFoundError(
+            f"Could not find training args at {training_args_path}. Pass a checkpoint or save directory that "
+            "contains training_args.bin."
+        )
+    return torch.load(training_args_path, map_location="cpu")
 
 
-def format_prompt(tokenizer, prompt_messages):
-    if tokenizer.chat_template is not None:
-        return tokenizer.apply_chat_template(prompt_messages, tokenize=False, add_generation_prompt=True)
+def build_eval_training_args(saved_training_args, eval_args: EvalArguments):
+    training_args = copy.deepcopy(saved_training_args)
 
-    rendered = []
-    for message in prompt_messages:
-        rendered.append(f"{message['role']}: {message['content']}")
-    rendered.append("assistant:")
-    return "\n".join(rendered)
+    training_args.output_dir = eval_args.output_dir
+    training_args.report_to = []
+    training_args.run_name = None
+    training_args.do_eval = True
+    training_args.eval_strategy = "steps"
+    training_args.save_strategy = "no"
+    training_args.logging_strategy = "steps"
+    training_args.logging_steps = 1
+    training_args.log_completions = False
+    training_args.gradient_checkpointing = False
+    training_args.gradient_checkpointing_kwargs = None
+    training_args.remove_unused_columns = False
 
+    if eval_args.per_device_eval_batch_size is not None:
+        training_args.per_device_eval_batch_size = eval_args.per_device_eval_batch_size
+    if eval_args.max_prompt_length is not None:
+        training_args.max_prompt_length = eval_args.max_prompt_length
+    if eval_args.max_completion_length is not None:
+        training_args.max_completion_length = eval_args.max_completion_length
+    if eval_args.num_generations is not None:
+        training_args.num_generations = eval_args.num_generations
+    if eval_args.use_vllm is not None:
+        training_args.use_vllm = eval_args.use_vllm
+    if eval_args.vllm_mode is not None:
+        training_args.vllm_mode = eval_args.vllm_mode
 
-def collate_examples(batch):
-    return {
-        "question": [example["question"] for example in batch],
-        "prompt": [example["prompt"] for example in batch],
-        "answer": [example["answer"] for example in batch],
-    }
-
-
-def summarize(values):
-    count = len(values)
-    mean = sum(values) / count if count else 0.0
-    return {"mean": mean, "count": count}
-
-
-def normalize_gathered_records(gathered_records):
-    if not gathered_records:
-        return []
-
-    first = gathered_records[0]
-    if isinstance(first, dict):
-        return list(gathered_records)
-
-    records = []
-    for chunk in gathered_records:
-        if isinstance(chunk, list):
-            records.extend(chunk)
-        elif isinstance(chunk, dict):
-            records.append(chunk)
-        else:
-            raise TypeError(f"Unexpected gathered record type: {type(chunk)!r}")
-    return records
+    return training_args
 
 
 def main():
     parser = HfArgumentParser(EvalArguments)
-    (args,) = parser.parse_args_into_dataclasses()
+    (eval_args,) = parser.parse_args_into_dataclasses()
 
     logging.basicConfig(format="%(asctime)s - %(levelname)s - %(name)s - %(message)s", level=logging.INFO)
-    accelerator = Accelerator()
 
-    if accelerator.is_main_process:
-        os.makedirs(args.output_dir, exist_ok=True)
+    saved_training_args = load_training_args(eval_args.model_name_or_path)
+    training_args = build_eval_training_args(saved_training_args, eval_args)
 
-    tokenizer_path = resolve_tokenizer_path(args.model_name_or_path, args.tokenizer_name_or_path)
+    tokenizer_path = resolve_tokenizer_path(eval_args.model_name_or_path, eval_args.tokenizer_name_or_path)
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "left"
 
     model_kwargs = {
-        "torch_dtype": get_dtype(args.torch_dtype),
+        "torch_dtype": "auto",
+        "use_cache": True,
     }
-    if args.attn_implementation is not None:
-        model_kwargs["attn_implementation"] = args.attn_implementation
-    model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, **model_kwargs)
-    model.to(accelerator.device)
-    model.eval()
+    if eval_args.attn_implementation is not None:
+        model_kwargs["attn_implementation"] = eval_args.attn_implementation
+    model = AutoModelForCausalLM.from_pretrained(eval_args.model_name_or_path, **model_kwargs)
 
-    eval_dataset: Dataset = get_gsm8k_questions(args.split)
-    shard_indices = list(range(accelerator.process_index, len(eval_dataset), accelerator.num_processes))
-    eval_dataset = eval_dataset.select(shard_indices)
-    dataloader = DataLoader(
-        eval_dataset,
-        batch_size=args.per_device_eval_batch_size,
-        shuffle=False,
-        collate_fn=collate_examples,
+    eval_dataset = get_gsm8k_questions(eval_args.split)
+    reward_funcs = build_reward_funcs(training_args)
+
+    trainer = GRPOTrainer(
+        model=model,
+        reward_funcs=reward_funcs,
+        args=training_args,
+        train_dataset=eval_dataset,
+        eval_dataset=eval_dataset,
+        processing_class=tokenizer,
+        callbacks=[],
     )
 
-    local_records = []
-    reward_names = [
-        "length_reward_func",
-        "int_reward_func",
-        "format_reward_func",
-        "correctness_reward_func",
-    ]
-    if args.max_length_threshold is not None:
-        reward_names.append("length_constraint_reward_func")
+    logger.info(
+        "Starting trainer-faithful GSM8K eval on split=%s with num_examples=%s, num_generations=%s, use_vllm=%s",
+        eval_args.split,
+        len(eval_dataset),
+        training_args.num_generations,
+        training_args.use_vllm,
+    )
 
-    for batch in dataloader:
-        prompt_texts = [format_prompt(tokenizer, prompt) for prompt in batch["prompt"]]
-        tokenized = tokenizer(
-            prompt_texts,
-            return_tensors="pt",
-            padding=True,
-            padding_side="left",
-            add_special_tokens=False,
-            truncation=True,
-            max_length=args.max_prompt_length,
-        )
-        tokenized = {key: value.to(accelerator.device) for key, value in tokenized.items()}
+    metrics = trainer.evaluate(eval_dataset=eval_dataset)
+    metrics["eval_samples"] = len(eval_dataset)
+    metrics["split"] = eval_args.split
+    metrics["model_name_or_path"] = eval_args.model_name_or_path
+    metrics["tokenizer_name_or_path"] = tokenizer_path
 
-        with torch.no_grad():
-            generated = model.generate(
-                **tokenized,
-                max_new_tokens=args.max_completion_length,
-                do_sample=args.do_sample,
-                temperature=args.temperature,
-                top_p=args.top_p,
-                pad_token_id=tokenizer.pad_token_id,
-                eos_token_id=tokenizer.eos_token_id,
-            )
+    os.makedirs(eval_args.output_dir, exist_ok=True)
+    metrics_path = os.path.join(eval_args.output_dir, "metrics.json")
+    with open(metrics_path, "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2, sort_keys=True)
 
-        completion_ids = generated[:, tokenized["input_ids"].shape[1] :]
-        completion_texts = tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
-        completion_ids_list = []
-        for row in completion_ids:
-            row_ids = row.tolist()
-            if tokenizer.eos_token_id in row_ids:
-                row_ids = row_ids[: row_ids.index(tokenizer.eos_token_id) + 1]
-            completion_ids_list.append(row_ids)
-
-        completions = [[{"content": text}] for text in completion_texts]
-
-        reward_values = {
-            "length_reward_func": length_reward_func(
-                completions=completions,
-                answer=batch["answer"],
-                completion_ids=completion_ids_list,
-            ),
-            "int_reward_func": int_reward_func(completions=completions),
-            "format_reward_func": format_reward_func(completions=completions),
-            "correctness_reward_func": correctness_reward_func(
-                prompts=batch["prompt"],
-                completions=completions,
-                answer=batch["answer"],
-                verbose_reward_logging=False,
-            ),
-        }
-        if args.max_length_threshold is not None:
-            reward_values["length_constraint_reward_func"] = length_constraint_reward_func(
-                completions=completions,
-                answer=batch["answer"],
-                completion_ids=completion_ids_list,
-                max_length_threshold=args.max_length_threshold,
-            )
-
-        for idx in range(len(batch["answer"])):
-            record = {
-                "question": batch["question"][idx],
-                "answer": batch["answer"][idx],
-                "completion": completion_texts[idx],
-                "completion_token_length": len(completion_ids_list[idx]),
-            }
-            for reward_name in reward_names:
-                record[reward_name] = reward_values[reward_name][idx]
-            local_records.append(record)
-
-    gathered_records = gather_object(local_records)
-
-    if accelerator.is_main_process:
-        records = normalize_gathered_records(gathered_records)
-
-        metrics = {
-            "model_name_or_path": args.model_name_or_path,
-            "tokenizer_name_or_path": tokenizer_path,
-            "split": args.split,
-            "num_examples": len(records),
-            "per_reward": {},
-        }
-        for reward_name in reward_names:
-            metrics["per_reward"][reward_name] = summarize([record[reward_name] for record in records])
-        metrics["mean_completion_token_length"] = summarize(
-            [record["completion_token_length"] for record in records]
-        )["mean"]
-
-        metrics_path = os.path.join(args.output_dir, "metrics.json")
-        predictions_path = os.path.join(args.output_dir, "predictions.jsonl")
-        with open(metrics_path, "w", encoding="utf-8") as f:
-            json.dump(metrics, f, indent=2)
-        with open(predictions_path, "w", encoding="utf-8") as f:
-            for record in records:
-                f.write(json.dumps(record, ensure_ascii=True) + "\n")
-
-        logger.info("Saved metrics to %s", metrics_path)
-        logger.info("Saved predictions to %s", predictions_path)
+    logger.info("Saved metrics to %s", metrics_path)
+    logger.info("Metrics: %s", json.dumps(metrics, indent=2, sort_keys=True))
 
 
 if __name__ == "__main__":
