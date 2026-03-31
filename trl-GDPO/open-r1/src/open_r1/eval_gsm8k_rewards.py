@@ -8,6 +8,7 @@ from typing import Optional
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, HfArgumentParser
 
+from open_r1.configs import GRPOConfig
 from open_r1.gsm8k import build_reward_funcs, get_gsm8k_questions
 from trl import GRPOTrainer
 
@@ -67,7 +68,8 @@ def load_training_args(model_path: str):
 
 
 def build_eval_training_args(saved_training_args, eval_args: EvalArguments):
-    training_args = copy.deepcopy(saved_training_args)
+    training_args_dict = saved_training_args.to_dict()
+    training_args = GRPOConfig(**training_args_dict)
 
     training_args.output_dir = eval_args.output_dir
     training_args.report_to = []
