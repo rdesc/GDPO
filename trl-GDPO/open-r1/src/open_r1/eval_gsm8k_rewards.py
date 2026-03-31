@@ -6,6 +6,7 @@ from typing import Optional
 
 import torch
 from accelerate import Accelerator
+from accelerate.utils import gather_object
 from datasets import Dataset
 from torch.utils.data import DataLoader
 from transformers import AutoModelForCausalLM, AutoTokenizer, HfArgumentParser
@@ -208,7 +209,7 @@ def main():
                 record[reward_name] = reward_values[reward_name][idx]
             local_records.append(record)
 
-    gathered_records = accelerator.gather_object(local_records)
+    gathered_records = gather_object(local_records)
 
     if accelerator.is_main_process:
         records = []
