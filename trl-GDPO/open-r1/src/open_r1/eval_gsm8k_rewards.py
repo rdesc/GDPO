@@ -63,7 +63,7 @@ def load_training_args(model_path: str):
             f"Could not find training args at {training_args_path}. Pass a checkpoint or save directory that "
             "contains training_args.bin."
         )
-    return torch.load(training_args_path, map_location="cpu")
+    return torch.load(training_args_path, map_location="cpu", weights_only=False)
 
 
 def build_eval_training_args(saved_training_args, eval_args: EvalArguments):

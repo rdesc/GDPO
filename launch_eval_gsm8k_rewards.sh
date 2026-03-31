@@ -31,7 +31,6 @@ ARGS=(
     --per_device_eval_batch_size 8
     --max_prompt_length 512
     --max_completion_length 1024
-    --torch_dtype bfloat16
 )
 
 if [[ -n "$TOKENIZER_PATH" ]]; then
