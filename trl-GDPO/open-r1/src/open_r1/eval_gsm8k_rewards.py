@@ -95,6 +95,25 @@ def summarize(values):
     return {"mean": mean, "count": count}
 
 
+def normalize_gathered_records(gathered_records):
+    if not gathered_records:
+        return []
+
+    first = gathered_records[0]
+    if isinstance(first, dict):
+        return list(gathered_records)
+
+    records = []
+    for chunk in gathered_records:
+        if isinstance(chunk, list):
+            records.extend(chunk)
+        elif isinstance(chunk, dict):
+            records.append(chunk)
+        else:
+            raise TypeError(f"Unexpected gathered record type: {type(chunk)!r}")
+    return records
+
+
 def main():
     parser = HfArgumentParser(EvalArguments)
     (args,) = parser.parse_args_into_dataclasses()
@@ -212,9 +231,7 @@ def main():
     gathered_records = gather_object(local_records)
 
     if accelerator.is_main_process:
-        records = []
-        for chunk in gathered_records:
-            records.extend(chunk)
+        records = normalize_gathered_records(gathered_records)
 
         metrics = {
             "model_name_or_path": args.model_name_or_path,
