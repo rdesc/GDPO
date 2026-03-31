@@ -95,14 +95,22 @@ def get_gsm8k_questions(split = "train") -> Dataset:
     }) # type: ignore
     return data # type: ignore
 
-dataset = get_gsm8k_questions()
+
+def get_gsm8k_dataset_dict(train_split="train", eval_split=None):
+    dataset_dict = {
+        train_split: get_gsm8k_questions(train_split),
+    }
+    if eval_split is not None and eval_split not in dataset_dict:
+        dataset_dict[eval_split] = get_gsm8k_questions(eval_split)
+    return datasets.DatasetDict(dataset_dict)
 
 # Reward functions
 def correctness_reward_func(prompts, completions, answer, **kwargs) -> list[float]:
     responses = [completion[0]['content'] for completion in completions]
     q = prompts[0][-1]['content']
     extracted_responses = [extract_xml_answer(r) for r in responses]
-    print('-'*20, f"Question:\n{q}", f"\nAnswer:\n{answer[0]}", f"\nResponse:\n{responses[0]}", f"\nExtracted:\n{extracted_responses[0]}")
+    if kwargs.get("verbose_reward_logging", False):
+        print('-'*20, f"Question:\n{q}", f"\nAnswer:\n{answer[0]}", f"\nResponse:\n{responses[0]}", f"\nExtracted:\n{extracted_responses[0]}")
     return [1.0 if r == a else 0.0 for r, a in zip(extracted_responses, answer)]
 
 def int_reward_func(completions, **kwargs) -> list[float]:
@@ -178,6 +186,14 @@ def length_constraint_reward_func(completions, answer, completion_ids, max_lengt
     return [1.0 if length <= max_length_threshold else 0.0 for length in lengths]
 
 
+def build_reward_funcs(training_args):
+    return [
+        length_reward_func,
+        int_reward_func,
+        format_reward_func,
+        correctness_reward_func,
+    ]
+
 
 
 
@@ -224,7 +240,11 @@ def main(script_args, training_args, model_args):
         init_wandb_training(training_args)
 
     # Load the dataset
-    dataset = get_gsm8k_questions()
+    eval_split = script_args.dataset_test_split if training_args.eval_strategy != "no" or training_args.do_eval else None
+    dataset = get_gsm8k_dataset_dict(
+        train_split=script_args.dataset_train_split,
+        eval_split=eval_split,
+    )
 
     ################
     # Load tokenizer
@@ -251,18 +271,13 @@ def main(script_args, training_args, model_args):
     #     format_reward_func,
     #     constraint_length_reward if training_args.use_constraints else length_reward_func,
     # ]
-    reward_funcs = [
-        length_reward_func,
-        int_reward_func,
-        format_reward_func,
-        correctness_reward_func,
-    ]
+    reward_funcs = build_reward_funcs(training_args)
 
     trainer = GRPOTrainer(
         model=model,
         reward_funcs=reward_funcs,
         args=training_args,
-        train_dataset=dataset,
+        train_dataset=dataset[script_args.dataset_train_split],
         eval_dataset=(dataset[script_args.dataset_test_split] if training_args.eval_strategy != "no" else None),
         peft_config=get_peft_config(model_args),
         callbacks=get_callbacks(training_args, model_args),
@@ -280,7 +295,7 @@ def main(script_args, training_args, model_args):
         checkpoint = last_checkpoint
     train_result = trainer.train(resume_from_checkpoint=checkpoint)
     metrics = train_result.metrics
-    metrics["train_samples"] = len(dataset)
+    metrics["train_samples"] = len(dataset[script_args.dataset_train_split])
     trainer.log_metrics("train", metrics)
     trainer.save_metrics("train", metrics)
     trainer.save_state()
@@ -305,6 +320,16 @@ def main(script_args, training_args, model_args):
         # Restore k,v cache for fast inference
         trainer.model.config.use_cache = True
         trainer.model.config.save_pretrained(training_args.output_dir)
+
+    ##########
+    # Evaluate
+    ##########
+    if training_args.do_eval:
+        logger.info("*** Evaluate ***")
+        metrics = trainer.evaluate()
+        metrics["eval_samples"] = len(dataset[script_args.dataset_test_split])
+        trainer.log_metrics("eval", metrics)
+        trainer.save_metrics("eval", metrics)
 
 
 
