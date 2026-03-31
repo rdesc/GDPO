@@ -81,6 +81,8 @@ def build_eval_training_args(saved_training_args, eval_args: EvalArguments):
     training_args.gradient_checkpointing = False
     training_args.gradient_checkpointing_kwargs = None
     training_args.remove_unused_columns = False
+    training_args.beta = 0.0
+    training_args.sync_ref_model = False
 
     if eval_args.per_device_eval_batch_size is not None:
         training_args.per_device_eval_batch_size = eval_args.per_device_eval_batch_size
