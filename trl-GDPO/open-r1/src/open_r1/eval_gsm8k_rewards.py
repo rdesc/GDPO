@@ -69,6 +69,7 @@ def load_training_args(model_path: str):
 
 def build_eval_training_args(saved_training_args, eval_args: EvalArguments):
     training_args_dict = saved_training_args.to_dict()
+    training_args_dict.pop("generation_batch_size", None)
     training_args = GRPOConfig(**training_args_dict)
 
     training_args.output_dir = eval_args.output_dir
