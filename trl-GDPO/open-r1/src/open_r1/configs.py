@@ -180,6 +180,38 @@ class GRPOConfig(trl.GRPOConfig):
         default=350,
         metadata={"help": "Maximum allowed completion length in tokens for the GSM8K length constraint."},
     )
+    use_ppo: bool = field(
+        default=False,
+        metadata={"help": "Enable PPO mode: use GAE advantages from a learned value head instead of group-relative normalization."},
+    )
+    gae_gamma: float = field(
+        default=1.0,
+        metadata={"help": "Discount factor (gamma) for GAE computation."},
+    )
+    gae_lambda: float = field(
+        default=0.95,
+        metadata={"help": "Lambda for GAE computation (bias-variance trade-off)."},
+    )
+    value_model_lr: float = field(
+        default=1e-4,
+        metadata={"help": "Learning rate for the value head optimizer."},
+    )
+    value_loss_coef: float = field(
+        default=0.5,
+        metadata={"help": "Coefficient for the value function loss."},
+    )
+    value_warmup_steps: int = field(
+        default=0,
+        metadata={"help": "Number of initial steps where only the value head trains (policy loss zeroed)."},
+    )
+    value_head_dropout: float = field(
+        default=0.0,
+        metadata={"help": "Dropout probability in value heads."},
+    )
+    separate_cost_values: bool = field(
+        default=True,
+        metadata={"help": "Use separate cost value heads per constraint (PPO-Lagrangian). If False, scalarize costs then use a single value head."},
+    )
 
 
 @dataclass

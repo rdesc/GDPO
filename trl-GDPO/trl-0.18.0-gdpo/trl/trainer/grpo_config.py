@@ -550,13 +550,14 @@ class GRPOConfig(TrainingArguments):
         self.steps_per_generation = self.generation_batch_size // (self.per_device_train_batch_size * num_processes)
 
         # Check if the effective batch size can be divided by the number of generations
-        if self.num_generations < 2:
+        if self.num_generations < 2 and not getattr(self, "use_ppo", False):
             raise ValueError(
                 "GRPO requires at least 2 generations per prompt to calculate the advantages. You provided "
                 f"{self.num_generations}, which is less than the minimum required."
             )
+        min_gen = 1 if getattr(self, "use_ppo", False) else 2
         possible_values = [
-            n_gen for n_gen in range(2, self.generation_batch_size + 1) if (self.generation_batch_size) % n_gen == 0
+            n_gen for n_gen in range(min_gen, self.generation_batch_size + 1) if (self.generation_batch_size) % n_gen == 0
         ]
 
         if self.num_generations not in possible_values:
