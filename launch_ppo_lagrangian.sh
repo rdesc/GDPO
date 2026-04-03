@@ -25,12 +25,17 @@ accelerate launch \
   --num_generations 1 \
   --vllm_mode colocate \
   --use_constraints True \
-  --constraints_thresholds 0.96 0.97 0.95 \
+  --constraints_thresholds 0.8 0.4 0.3 \
   --update_constraints_every_k_policy_steps 1 \
   --max_length_threshold 600 \
   --separate_cost_values True \
   --gradient_accumulation_steps 1 \
   --beta 0.2 \
-  --value_warmup_steps 10 \
-  --run_name "Qwen2.5-1.5B-gsm8k-PPO-Lagrangian-beta02" \
+  --value_warmup_steps 50 \
+  --per_device_train_batch_size 8 \
+  --value_model_type separate \
+  --value_model_use_lora True \
+  --value_model_lora_rank 64 \
+  --value_model_lora_alpha 128 \
+  --run_name "Qwen2.5-1.5B-gsm8k-PPO-Lag-separate-lora" \
   --output_dir /home/mila/d/deschaer/scratch/ppo_lagrangian_gsm8k/

@@ -25,7 +25,8 @@ from transformers import (
 
 from .grpo_config import GRPOConfig
 from .grpo_trainer import GRPOTrainer, RewardFunc, nanmin, nanmax
-from .value_model import ValueModelWrapper
+from .value_model import ValueModelWrapper, ValueModel
+from ..models import prepare_deepspeed
 
 try:
     from peft import PeftConfig
@@ -78,25 +79,104 @@ class GRPOPPOTrainer(GRPOTrainer):
         self.value_warmup_steps = getattr(args, "value_warmup_steps", 0)
         self.separate_cost_values = getattr(args, "separate_cost_values", True)
 
-        # Initialize value model
-        hidden_size = self.model.config.hidden_size
+        self.value_model_type = getattr(args, "value_model_type", "lightweight")
         cost_head_names = (
             self.constraint_names
             if self.use_constraints and self.separate_cost_values
             else []
         )
-        self.value_model = ValueModelWrapper(
-            hidden_size=hidden_size,
-            cost_head_names=cost_head_names,
-            lr=getattr(args, "value_model_lr", 1e-4),
-            dropout_prob=getattr(args, "value_head_dropout", 0.0),
-        )
+
+        if self.value_model_type == "separate":
+            # Separate backbone value model
+            value_model_id = getattr(args, "value_model_name_or_path", None)
+            if value_model_id is None:
+                # Fall back to the policy model name
+                value_model_id = args.model_name_or_path if hasattr(args, "model_name_or_path") else model if isinstance(model, str) else model.config._name_or_path
+            model_init_kwargs = {}
+            if hasattr(args, "torch_dtype") and args.torch_dtype is not None:
+                model_init_kwargs["torch_dtype"] = args.torch_dtype
+            self.value_model = ValueModel(
+                model_id=value_model_id,
+                model_init_kwargs=model_init_kwargs,
+                lr=getattr(args, "value_model_lr", 1e-4),
+                dropout_prob=getattr(args, "value_head_dropout", 0.0),
+            )
+            if cost_head_names:
+                self.value_model.add_cost_heads(cost_head_names)
+            if getattr(args, "value_model_use_lora", False):
+                self.value_model.apply_lora(
+                    rank=getattr(args, "value_model_lora_rank", 64),
+                    alpha=getattr(args, "value_model_lora_alpha", 128),
+                )
+        else:
+            # Lightweight value head on policy hidden states (original behaviour)
+            hidden_size = self.model.config.hidden_size
+            self.value_model = ValueModelWrapper(
+                hidden_size=hidden_size,
+                cost_head_names=cost_head_names,
+                lr=getattr(args, "value_model_lr", 1e-4),
+                dropout_prob=getattr(args, "value_head_dropout", 0.0),
+            )
+
         # Create optimizer BEFORE DDP wrapping (DDP hides custom methods).
         # Store a direct reference since DDP wrapping makes .optimizer inaccessible.
         self.value_model.create_optimizer()
         self.value_optimizer = self.value_model.optimizer
-        # Wrap with accelerator for DDP gradient sync
-        self.value_model = self.accelerator.prepare(self.value_model)
+
+        # Prepare value model for distributed training
+        if self.is_deepspeed_enabled and self.value_model_type == "separate":
+            # Under DeepSpeed ZeRO-3, we need deepspeed.initialize() with the
+            # optimizer so the backbone gets properly sharded while remaining
+            # trainable (heads + optional LoRA).  prepare_deepspeed() is for
+            # inference-only models (no optimizer, calls model.eval()).
+            self.value_model, self.value_optimizer = self._prepare_value_model_deepspeed(
+                self.value_model, self.value_optimizer
+            )
+        else:
+            # DDP or lightweight heads — accelerator.prepare handles wrapping
+            self.value_model = self.accelerator.prepare(self.value_model)
+
+    def _prepare_value_model_deepspeed(self, value_model, optimizer):
+        """
+        Initialize the separate-backbone value model with DeepSpeed.
+
+        Unlike ``prepare_deepspeed`` (which is inference-only and calls
+        ``model.eval()``), this passes the optimizer so that ZeRO can
+        shard both the frozen backbone *and* the trainable heads/LoRA.
+        """
+        import deepspeed
+        from copy import deepcopy
+
+        deepspeed_plugin = self.accelerator.state.deepspeed_plugin
+        config_kwargs = deepcopy(deepspeed_plugin.deepspeed_config)
+        stage = config_kwargs["zero_optimization"]["stage"]
+
+        hidden_size = getattr(value_model.config, "hidden_size", None)
+        if hidden_size is not None and stage == 3:
+            config_kwargs.update(
+                {
+                    "zero_optimization.reduce_bucket_size": hidden_size * hidden_size,
+                    "zero_optimization.stage3_param_persistence_threshold": 10 * hidden_size,
+                    "zero_optimization.stage3_prefetch_bucket_size": 0.9 * hidden_size * hidden_size,
+                }
+            )
+
+        # Remove scheduler config — the value model uses a fixed LR, and
+        # the Trainer's scheduler config references the *policy* optimizer's
+        # total steps which would be wrong here.
+        config_kwargs.pop("scheduler", None)
+
+        # Remove optimizer config so DeepSpeed uses the optimizer we pass in
+        # rather than trying to construct one from config.
+        config_kwargs.pop("optimizer", None)
+
+        engine, ds_optimizer, *_ = deepspeed.initialize(
+            model=value_model,
+            optimizer=optimizer,
+            config=config_kwargs,
+        )
+        # engine.train() is the default — keep it so heads + LoRA get gradients
+        return engine, ds_optimizer
 
     # ── GAE helpers ──
 
@@ -352,12 +432,18 @@ class GRPOPPOTrainer(GRPOTrainer):
 
         local_rewards = rewards[process_slice]
 
-        # Extract hidden states from policy backbone (no grad — only for value targets)
+        # Compute value predictions (no grad — only for GAE targets)
         with torch.no_grad():
-            completion_hidden = self._get_completion_hidden_states(
-                self.model, prompt_completion_ids, attention_mask, prompt_ids.size(1), batch_size
-            )
-            reward_values, cost_values_dict = self.value_model(completion_hidden)
+            if self.value_model_type == "separate":
+                vm = self.value_model.module if hasattr(self.value_model, "module") else self.value_model
+                reward_values, cost_values_dict = vm.get_values_for_completion(
+                    prompt_completion_ids, attention_mask, prompt_ids.size(1), batch_size
+                )
+            else:
+                completion_hidden = self._get_completion_hidden_states(
+                    self.model, prompt_completion_ids, attention_mask, prompt_ids.size(1), batch_size
+                )
+                reward_values, cost_values_dict = self.value_model(completion_hidden)
 
         # GAE for main reward
         advantages, returns = self._compute_gae(local_rewards, reward_values.detach(), completion_mask)
@@ -595,16 +681,23 @@ class GRPOPPOTrainer(GRPOTrainer):
             raise ValueError(f"Unknown loss type: {self.loss_type}")
 
         # ── Value loss ──
-        # Recompute values from current policy hidden states.
-        # IMPORTANT: detach hidden states so value loss gradients do NOT flow
-        # back into the policy backbone (only the value head params get gradients).
-        with torch.no_grad():
-            completion_hidden = self._get_completion_hidden_states(
-                model, input_ids, attention_mask, prompt_ids.size(1)
+        if self.value_model_type == "separate":
+            # Separate backbone: forward through the value model engine/wrapper.
+            # Under DeepSpeed ZeRO-3 the forward must go through the engine so
+            # that sharded parameters are properly gathered.
+            vm = self.value_model.module if hasattr(self.value_model, "module") else self.value_model
+            reward_values, cost_values_dict = vm.get_values_for_completion(
+                input_ids, attention_mask, prompt_ids.size(1)
             )
-        # detach ensures the value head gradient graph starts here
-        completion_hidden = completion_hidden.detach()
-        reward_values, cost_values_dict = self.value_model(completion_hidden)
+        else:
+            # Lightweight: extract hidden states from policy backbone (detached)
+            # so value loss gradients do NOT flow back into the policy.
+            with torch.no_grad():
+                completion_hidden = self._get_completion_hidden_states(
+                    model, input_ids, attention_mask, prompt_ids.size(1)
+                )
+            completion_hidden = completion_hidden.detach()
+            reward_values, cost_values_dict = self.value_model(completion_hidden)
 
         returns = inputs["returns"]
         vf_loss = ValueModelWrapper.compute_value_loss(reward_values, returns, completion_mask)
@@ -619,9 +712,15 @@ class GRPOPPOTrainer(GRPOTrainer):
         # Step value optimizer (separate from policy optimizer).
         # Only during training — during eval, no gradient graph exists.
         if self.model.training:
-            self.value_optimizer.zero_grad()
-            (self.value_loss_coef * vf_loss).backward()
-            self.value_optimizer.step()
+            scaled_vf_loss = self.value_loss_coef * vf_loss
+            if self.is_deepspeed_enabled and self.value_model_type == "separate":
+                # DeepSpeed engine manages backward + optimizer step
+                self.value_model.backward(scaled_vf_loss)
+                self.value_model.step()
+            else:
+                self.value_optimizer.zero_grad()
+                scaled_vf_loss.backward()
+                self.value_optimizer.step()
 
         # ── Logging ──
         mode = "train" if self.model.training else "eval"

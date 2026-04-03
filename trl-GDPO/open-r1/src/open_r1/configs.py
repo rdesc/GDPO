@@ -212,6 +212,26 @@ class GRPOConfig(trl.GRPOConfig):
         default=True,
         metadata={"help": "Use separate cost value heads per constraint (PPO-Lagrangian). If False, scalarize costs then use a single value head."},
     )
+    value_model_type: str = field(
+        default="lightweight",
+        metadata={"help": "Type of value model: 'lightweight' (linear heads on policy hidden states) or 'separate' (own backbone with heads)."},
+    )
+    value_model_name_or_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Model name or path for the separate value backbone. If None, uses the same model as the policy."},
+    )
+    value_model_use_lora: bool = field(
+        default=False,
+        metadata={"help": "Apply LoRA adapters to the separate value backbone."},
+    )
+    value_model_lora_rank: int = field(
+        default=64,
+        metadata={"help": "LoRA rank for the separate value backbone."},
+    )
+    value_model_lora_alpha: int = field(
+        default=128,
+        metadata={"help": "LoRA alpha for the separate value backbone."},
+    )
 
 
 @dataclass

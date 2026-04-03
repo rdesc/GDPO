@@ -24,8 +24,13 @@ accelerate launch \
   --use_ppo True \
   --num_generations 1 \
   --vllm_mode colocate \
-  --gradient_accumulation_steps 1 \
+  --per_device_train_batch_size 8 \
+  --gradient_accumulation_steps 2 \
   --beta 0.2 \
-  --value_warmup_steps 10 \
-  --run_name "Qwen2.5-1.5B-gsm8k-PPO-beta02" \
-  --output_dir /home/mila/d/deschaer/scratch/ppo_gsm8k/
+  --value_warmup_steps 50 \
+  --value_model_type separate \
+  --value_model_use_lora True \
+  --value_model_lora_rank 64 \
+  --value_model_lora_alpha 128 \
+  --run_name "Qwen2.5-1.5B-gsm8k-PPO-separate-lora" \
+  --output_dir /home/mila/d/deschaer/scratch/ppo_gsm8k_separate/
