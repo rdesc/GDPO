@@ -22,15 +22,18 @@ accelerate launch \
   src/open_r1/gsm8k.py \
   --config recipes/Qwen2.5-1.5B-Instruct/ppo_gsm8k/config.yaml \
   --use_ppo True \
-  --num_generations 1 \
+  --num_generations 8 \
   --vllm_mode colocate \
   --per_device_train_batch_size 8 \
-  --gradient_accumulation_steps 2 \
-  --beta 0.2 \
+  --gradient_accumulation_steps 8 \
+  --learning_rate 1e-6 \
+  --beta 0.04 \
+  --advantage_type reinforce \
   --value_warmup_steps 50 \
   --value_model_type separate \
   --value_model_use_lora True \
   --value_model_lora_rank 64 \
   --value_model_lora_alpha 128 \
-  --run_name "Qwen2.5-1.5B-gsm8k-PPO-separate-lora" \
-  --output_dir /home/mila/d/deschaer/scratch/ppo_gsm8k_separate/
+  --value_model_lr 1e-5 \
+  --run_name "Qwen2.5-1.5B-gsm8k-PPO-reinforce-vf-grad-accum" \
+  --output_dir /home/mila/d/deschaer/scratch/saves/rl/

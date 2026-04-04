@@ -184,6 +184,10 @@ class GRPOConfig(trl.GRPOConfig):
         default=False,
         metadata={"help": "Enable PPO mode: use GAE advantages from a learned value head instead of group-relative normalization."},
     )
+    advantage_type: str = field(
+        default="gae",
+        metadata={"help": "Advantage estimation method: 'gae' (per-token GAE) or 'reinforce' (per-sequence R - V baseline)."},
+    )
     gae_gamma: float = field(
         default=1.0,
         metadata={"help": "Discount factor (gamma) for GAE computation."},

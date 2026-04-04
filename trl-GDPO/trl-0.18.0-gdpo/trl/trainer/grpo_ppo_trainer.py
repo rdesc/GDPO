@@ -73,6 +73,7 @@ class GRPOPPOTrainer(GRPOTrainer):
         )
 
         # PPO-specific config (read from args with defaults for backward compat)
+        self.advantage_type = getattr(args, "advantage_type", "gae")
         self.gae_gamma = getattr(args, "gae_gamma", 1.0)
         self.gae_lambda = getattr(args, "gae_lambda", 0.95)
         self.value_loss_coef = getattr(args, "value_loss_coef", 0.5)
@@ -122,6 +123,10 @@ class GRPOPPOTrainer(GRPOTrainer):
         # Store a direct reference since DDP wrapping makes .optimizer inaccessible.
         self.value_model.create_optimizer()
         self.value_optimizer = self.value_model.optimizer
+
+        # Counter for value gradient accumulation — mirrors the policy's
+        # gradient_accumulation_steps so value model updates at the same rate.
+        self._value_accum_counter = 0
 
         # Prepare value model for distributed training
         if self.is_deepspeed_enabled and self.value_model_type == "separate":
@@ -231,6 +236,52 @@ class GRPOPPOTrainer(GRPOTrainer):
         mean = sums.sum() / total.clamp(min=1)
         std = ((sq_sums.sum() / total.clamp(min=1)) - mean ** 2).clamp(min=0).sqrt() + 1e-8
         return ((advantages - mean) / std) * mask
+
+    def _compute_reinforce_advantage(self, rewards, values, mask):
+        """
+        REINFORCE with value baseline: advantage = R - V, broadcast to all tokens.
+
+        Args:
+            rewards: (B,) per-sequence scalar rewards
+            values: (B, T) per-token value predictions (detached)
+            mask: (B, T) completion mask
+
+        Returns:
+            advantages: (B, T) per-token advantages (constant per sequence)
+            returns: (B, T) per-token returns (for value loss target)
+        """
+        # Value baseline: V(s_0) — value at the first completion token
+        baseline = values[:, 0]  # (B,)
+        advantage = rewards - baseline  # (B,) scalar advantage per sequence
+        # Broadcast to all tokens
+        advantages = advantage.unsqueeze(1).expand_as(mask) * mask  # (B, T)
+        # Returns: the actual reward broadcast to all tokens (target for value model)
+        returns = rewards.unsqueeze(1).expand_as(mask) * mask  # (B, T)
+        return advantages, returns
+
+    def _value_forward_completion(self, input_ids, attention_mask, prompt_length, batch_size=None):
+        """Forward through the separate-backbone value model, returning completion-only values.
+
+        Calls ``self.value_model(...)`` directly (the DeepSpeed engine or DDP wrapper)
+        rather than unwrapping to ``.module``, so that ZeRO-3 parameter gathering works.
+        """
+        batch_size = batch_size or input_ids.size(0)
+        vm_inner = self.value_model.module if hasattr(self.value_model, "module") else self.value_model
+        cost_names = getattr(vm_inner, "cost_head_names", [])
+        all_reward = []
+        all_cost: dict[str, list[torch.Tensor]] = {name: [] for name in cost_names}
+
+        for i in range(0, input_ids.size(0), batch_size):
+            ids_b = input_ids[i:i + batch_size]
+            mask_b = attention_mask[i:i + batch_size]
+            rv, cv = self.value_model(ids_b, mask_b)
+            all_reward.append(rv[:, prompt_length:])
+            for name in cost_names:
+                all_cost[name].append(cv[name][:, prompt_length:])
+
+        reward_values = torch.cat(all_reward, dim=0)
+        cost_values = {name: torch.cat(chunks, dim=0) for name, chunks in all_cost.items()}
+        return reward_values, cost_values
 
     def _get_completion_hidden_states(self, model, input_ids, attention_mask, prompt_length, batch_size=None):
         """Extract hidden states for completion tokens from the policy backbone.
@@ -435,8 +486,7 @@ class GRPOPPOTrainer(GRPOTrainer):
         # Compute value predictions (no grad — only for GAE targets)
         with torch.no_grad():
             if self.value_model_type == "separate":
-                vm = self.value_model.module if hasattr(self.value_model, "module") else self.value_model
-                reward_values, cost_values_dict = vm.get_values_for_completion(
+                reward_values, cost_values_dict = self._value_forward_completion(
                     prompt_completion_ids, attention_mask, prompt_ids.size(1), batch_size
                 )
             else:
@@ -445,28 +495,29 @@ class GRPOPPOTrainer(GRPOTrainer):
                 )
                 reward_values, cost_values_dict = self.value_model(completion_hidden)
 
-        # GAE for main reward
-        advantages, returns = self._compute_gae(local_rewards, reward_values.detach(), completion_mask)
+        # Compute advantages (GAE or REINFORCE)
+        _adv_fn = self._compute_reinforce_advantage if self.advantage_type == "reinforce" else self._compute_gae
+        advantages, returns = _adv_fn(local_rewards, reward_values.detach(), completion_mask)
         advantages = self._normalize_advantages(advantages, completion_mask)
 
-        # PPO-Lagrangian: separate GAE per constraint, blend with multipliers
+        # PPO-Lagrangian: separate advantage per constraint, blend with multipliers
         cost_returns_dict = {}
         if self.use_constraints and self.separate_cost_values and constraint_values is not None:
             advantages = reward_weight * advantages
             for k, name in enumerate(self.constraint_names):
                 local_cost = constraint_values[process_slice, k]
                 cost_val = cost_values_dict[name].detach()
-                cost_adv, cost_ret = self._compute_gae(local_cost, cost_val, completion_mask)
+                cost_adv, cost_ret = _adv_fn(local_cost, cost_val, completion_mask)
                 cost_adv = self._normalize_advantages(cost_adv, completion_mask)
                 cost_returns_dict[name] = cost_ret
                 advantages = advantages + cost_weights[k] * cost_adv
         elif self.use_constraints and not self.separate_cost_values and constraint_values is not None:
-            # Scalarize then single GAE (simpler, like original CGRPO)
+            # Scalarize then single advantage (simpler, like original CGRPO)
             scalar_rewards = local_rewards * reward_weight
             for k, name in enumerate(self.constraint_names):
                 k_cost = constraint_values[process_slice, k]
                 scalar_rewards = scalar_rewards + cost_weights[k] * k_cost
-            advantages, returns = self._compute_gae(scalar_rewards, reward_values.detach(), completion_mask)
+            advantages, returns = _adv_fn(scalar_rewards, reward_values.detach(), completion_mask)
             advantages = self._normalize_advantages(advantages, completion_mask)
 
         # Log value metrics
@@ -682,11 +733,7 @@ class GRPOPPOTrainer(GRPOTrainer):
 
         # ── Value loss ──
         if self.value_model_type == "separate":
-            # Separate backbone: forward through the value model engine/wrapper.
-            # Under DeepSpeed ZeRO-3 the forward must go through the engine so
-            # that sharded parameters are properly gathered.
-            vm = self.value_model.module if hasattr(self.value_model, "module") else self.value_model
-            reward_values, cost_values_dict = vm.get_values_for_completion(
+            reward_values, cost_values_dict = self._value_forward_completion(
                 input_ids, attention_mask, prompt_ids.size(1)
             )
         else:
@@ -709,18 +756,26 @@ class GRPOPPOTrainer(GRPOTrainer):
                 cost_vf = ValueModelWrapper.compute_value_loss(cost_values_dict[name], cost_ret, completion_mask)
                 vf_loss = vf_loss + cost_vf
 
-        # Step value optimizer (separate from policy optimizer).
-        # Only during training — during eval, no gradient graph exists.
+        # Accumulate value gradients and step at the same rate as the policy.
+        # Without this, the value model would update gradient_accumulation_steps
+        # times per policy update, causing it to overfit to stale return targets.
         if self.model.training:
-            scaled_vf_loss = self.value_loss_coef * vf_loss
+            grad_accum = self.args.gradient_accumulation_steps
+            scaled_vf_loss = self.value_loss_coef * vf_loss / grad_accum
+            self._value_accum_counter += 1
+            should_step = self._value_accum_counter >= grad_accum
+
             if self.is_deepspeed_enabled and self.value_model_type == "separate":
-                # DeepSpeed engine manages backward + optimizer step
                 self.value_model.backward(scaled_vf_loss)
-                self.value_model.step()
+                if should_step:
+                    self.value_model.step()
+                    self._value_accum_counter = 0
             else:
-                self.value_optimizer.zero_grad()
                 scaled_vf_loss.backward()
-                self.value_optimizer.step()
+                if should_step:
+                    self.value_optimizer.step()
+                    self.value_optimizer.zero_grad()
+                    self._value_accum_counter = 0
 
         # ── Logging ──
         mode = "train" if self.model.training else "eval"
