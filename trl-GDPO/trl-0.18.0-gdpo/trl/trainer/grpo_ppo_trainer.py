@@ -72,6 +72,17 @@ class GRPOPPOTrainer(GRPOTrainer):
             peft_config=peft_config,
         )
 
+        # Ensure generation doesn't fire mid gradient-accumulation.
+        # With ZeRO-3, _move_model_to_vllm requires all params to be partitioned,
+        # which fails if a backward pass left them gathered.
+        generate_every = self.args.steps_per_generation * self.num_iterations
+        assert generate_every >= self.args.gradient_accumulation_steps, (
+            f"steps_per_generation ({self.args.steps_per_generation}) * num_iterations "
+            f"({self.num_iterations}) = {generate_every} must be >= "
+            f"gradient_accumulation_steps ({self.args.gradient_accumulation_steps}). "
+            f"Otherwise generation triggers mid-accumulation and crashes with ZeRO-3."
+        )
+
         # PPO-specific config (read from args with defaults for backward compat)
         self.advantage_type = getattr(args, "advantage_type", "gae")
         self.gae_gamma = getattr(args, "gae_gamma", 1.0)
@@ -436,7 +447,6 @@ class GRPOPPOTrainer(GRPOTrainer):
             main_rewards = rewards_per_func_filter[:, 0]
             constraint_rewards = rewards_per_func_filter[:, 1:]
             constraint_values = 1.0 - constraint_rewards
-            self.constraints_list.append(constraint_values.detach().cpu())
 
             avg_cv = constraint_values.mean(0)
             avg_cs = constraint_rewards.mean(0)
@@ -446,9 +456,20 @@ class GRPOPPOTrainer(GRPOTrainer):
 
             multipliers = F.softmax(self.multiplier_params, dim=0)[1:]
 
+            # Only accumulate constraints and update multipliers on fresh generations
+            # (first step of each generation cycle), not on replayed inner iterations.
+            # Uses self._step (incremented by get_batch_samples) for consistency with
+            # the value update gating logic.
+            generate_every = self.args.steps_per_generation * self.num_iterations
+            cur_step = max(self._step - 1, 0)
+            steps_into_cycle = cur_step % generate_every
+            is_fresh_generation = steps_into_cycle < self.args.steps_per_generation
+
             # Skip multiplier updates during value warmup
             in_warmup = self.value_warmup_steps > 0 and self.state.global_step <= self.value_warmup_steps
-            if self.state.global_step % self.update_every_k_policy_steps == 0 and len(self.constraints_list) > 0 and not in_warmup:
+            if is_fresh_generation and not in_warmup:
+                self.constraints_list.append(constraint_values.detach().cpu())
+            if is_fresh_generation and self.state.global_step % self.update_every_k_policy_steps == 0 and len(self.constraints_list) > 0 and not in_warmup:
                 train_avg = torch.cat(self.constraints_list, dim=0).to(device=device).mean(0)
                 thresholds = []
                 for k_i in range(len(self.constraint_names)):
@@ -756,10 +777,21 @@ class GRPOPPOTrainer(GRPOTrainer):
                 cost_vf = ValueModelWrapper.compute_value_loss(cost_values_dict[name], cost_ret, completion_mask)
                 vf_loss = vf_loss + cost_vf
 
-        # Accumulate value gradients and step at the same rate as the policy.
-        # Without this, the value model would update gradient_accumulation_steps
-        # times per policy update, causing it to overfit to stale return targets.
-        if self.model.training:
+        # Only update the value model for the first optimizer-step worth of
+        # micro-batches in each generation cycle.  On subsequent PPO inner
+        # iterations the return targets are stale (computed from V_old at
+        # generation time), so continued value updates cause oscillatory
+        # overfitting.  We allow exactly `steps_per_generation` steps (one full
+        # pass through the generation slices) so the value model accumulates
+        # enough gradients for one optimizer step.
+        generate_every = self.args.steps_per_generation * self.num_iterations
+        # _step has already been incremented by get_batch_samples, so subtract 1
+        cur_step = max(self._step - 1, 0)
+        steps_into_cycle = cur_step % generate_every
+        value_update_window = max(self.args.steps_per_generation,
+                                  self.args.gradient_accumulation_steps)
+
+        if self.model.training and steps_into_cycle < value_update_window:
             grad_accum = self.args.gradient_accumulation_steps
             scaled_vf_loss = self.value_loss_coef * vf_loss / grad_accum
             self._value_accum_counter += 1
