@@ -484,6 +484,7 @@ class GRPOTrainer(Trainer):
         else:
             self.apply_gdpo = False
         self.use_constraints = getattr(args, "use_constraints", False)
+        self.use_normalized_multipliers = getattr(args, "use_normalized_multipliers", True)
         self.constraint_names = self.reward_func_names[1:] if self.use_constraints else []
         self.constraints_list = []
         self.update_every_k_policy_steps = getattr(args, "update_constraints_every_k_policy_steps", 1)
@@ -638,9 +639,13 @@ class GRPOTrainer(Trainer):
                     f"Number of constraint thresholds ({len(constraint_thresholds)}) must match number of constraints "
                     f"({len(self.constraint_names)})"
                 )
+            multiplier_size = (
+                len(self.constraint_names) + 1 if self.use_normalized_multipliers else len(self.constraint_names)
+            )
+            multiplier_init = 0.02 if self.use_normalized_multipliers else 0.0
             self.multiplier_params = torch.full(
-                size=(len(self.constraint_names) + 1,),
-                fill_value=0.02,
+                size=(multiplier_size,),
+                fill_value=multiplier_init,
                 requires_grad=True,
                 device=self.accelerator.device,
             )
@@ -1265,7 +1270,10 @@ class GRPOTrainer(Trainer):
                     avg_constraint_satisfaction[k].item()
                 )
 
-            multipliers = torch.nn.functional.softmax(self.multiplier_params, dim=0)[1:]
+            if self.use_normalized_multipliers:
+                multipliers = torch.nn.functional.softmax(self.multiplier_params, dim=0)[1:]
+            else:
+                multipliers = torch.clamp(self.multiplier_params, min=0.0)
             if self.state.global_step % self.update_every_k_policy_steps == 0 and len(self.constraints_list) > 0:
                 train_avg_constraint_values = torch.cat(self.constraints_list, dim=0).to(device=device).mean(0)
                 enforced_thresholds = []
@@ -1284,16 +1292,23 @@ class GRPOTrainer(Trainer):
                 self.multipliers_optim.zero_grad()
                 multiplier_loss.backward()
                 self.multipliers_optim.step()
+                if not self.use_normalized_multipliers:
+                    with torch.no_grad():
+                        self.multiplier_params.clamp_(min=0.0)
                 self.constraints_list = []
 
             cost_weights = self.multiplier_signs * multipliers.detach()
-            reward_weight = 1.0 - torch.sum(torch.abs(cost_weights), dim=0)
+            if self.use_normalized_multipliers:
+                reward_weight = 1.0 - torch.sum(torch.abs(cost_weights), dim=0)
+            else:
+                reward_weight = torch.tensor(1.0, dtype=cost_weights.dtype, device=cost_weights.device)
             self._metrics[mode]["multipliers/reward_weight"].append(
                 self.accelerator.gather_for_metrics(reward_weight).mean().item()
             )
             for k, constraint_name in enumerate(self.constraint_names):
+                multiplier_param_index = k + 1 if self.use_normalized_multipliers else k
                 self._metrics[mode][f"raw_multipliers_values/{constraint_name}"].append(
-                    self.accelerator.gather_for_metrics(self.multiplier_params[k + 1]).mean().item()
+                    self.accelerator.gather_for_metrics(self.multiplier_params[multiplier_param_index]).mean().item()
                 )
                 self._metrics[mode][f"multipliers/{constraint_name}"].append(
                     self.accelerator.gather_for_metrics(torch.abs(cost_weights[k])).mean().item()
@@ -1328,7 +1343,8 @@ class GRPOTrainer(Trainer):
                         self.num_generations, dim=0
                     )
                     constraint_advantage = curr_constraint_values - mean_grouped_curr_constraint
-                    constraint_advantage = constraint_advantage / (std_grouped_curr_constraint + 1e-4)
+                    if self.scale_rewards:
+                        constraint_advantage = constraint_advantage / (std_grouped_curr_constraint + 1e-4)
                     advantages = advantages + (cost_weights[k] * constraint_advantage)
 
         ### only apply gdpo when having more than one reward

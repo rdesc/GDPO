@@ -445,6 +445,13 @@ class GRPOConfig(TrainingArguments):
             "help": "Whether to apply GDPO: Group reward-Decoupled Normalization Policy Optimization for Multi-reward RL Optimization"
         },
     )  
+    use_normalized_multipliers: bool = field(
+        default=True,
+        metadata={
+            "help": "When using constraints, apply softmax normalization to the constraint multipliers. If `False`, "
+            "constraint multipliers are optimized directly, initialized to zero, and clamped to be non-negative."
+        },
+    )
     scale_rewards: bool = field(
         default=True,
         metadata={
